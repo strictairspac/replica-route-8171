@@ -1,3 +1,5 @@
 -- Initial schema is applied idempotently by SQLAlchemy metadata.create_all.
 -- Authoritative entities: users, nodes, request_sets, trials, audit_logs.
 -- Routing request events and frozen input/result evidence are MySQL JSON.
+-- DDL-lock drill entities: lock_scenarios (frozen ordered event timeline),
+-- lock_drills (frozen node/scenario snapshot, policy, result evidence JSON).

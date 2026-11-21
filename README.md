@@ -8,6 +8,8 @@
 
 三个核心实体：复制节点 Node（主副角色/在线状态/日志谱系/位点/延迟），会话请求集 RequestSet（带时序的读写、复制应用、故障恢复事件），路由试验 Trial（冻结输入、策略参数与结果）。4业务页+登录页，另有管理员审计。
 
+第二个演练域为副本 DDL 锁表回放：锁表场景 LockScenario（长查询起止、DDL 变更、主库并发写、副本回放、回放中断/恢复的冻结时序）与锁表演练 LockDrill（目标副本、新版查询别站、cancel/wait 策略与宽限、确定性结果）。对应 3 个业务页：锁表时序、锁表执行、锁表证据。
+
 **这是受控复制路由模型，不连接真实主从集群。** MySQL真实保存节点、请求、任务及证据；Python真实逐事件计算策略。日志位点采用命名谱系中的单调整数，未实现完整GTID集合/真实复制协议。
 
 ## 快速启动
@@ -53,13 +55,34 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 输出每事件目标/拒绝、会话所需位点、实际位点、各副本四项资格、最终节点、会话状态、汇总和SHA256。相同输入产生相同摘要；不依赖随机数或外部网络。拒绝不安全读是正常业务结果，不算任务失败。快照与结果保存在MySQL，Redis只传递任务ID。
 
+## 锁表回放计算规则
+
+锁表场景事件按 at_ms 非递减、同时刻按输入顺序执行，最多100条；主库持续并发写（`primary_write`/`ddl_change` 各让主库提交位点+1）。事件类型：
+
+```json
+[
+  {"at_ms":200,"kind":"query_start","query_id":"Q1-old","duration_ms":3600,"version":"old","session":"lab-A"},
+  {"at_ms":1000,"kind":"ddl_change","table_name":"orders"},
+  {"at_ms":1500,"kind":"replica_apply","node":"south-replica","position":106},
+  {"at_ms":1600,"kind":"replay_interrupt","node":"south-replica"},
+  {"at_ms":2000,"kind":"replay_resume","node":"south-replica"}
+]
+```
+
+- 副本只在 `replica_apply` 回放到 DDL 变更位点时才请求表锁；位点必须单调，禁止跳过变更位点直接回放更后位置（入队前422）。
+- 目标副本上所有在跑的旧版（version=old）长查询都是表锁阻塞者。`cancel` 策略给 `grace_ms` 宽限，到期仍持锁就一次性取消这些查询并应用 DDL；`wait` 策略不取消，DDL 等到阻塞查询自然结束。
+- 中断（`replay_interrupt`）冻结位点和宽限时钟，期间不取消、不推进；恢复（`replay_resume`）从中断点重试，已取消查询不重复取消、已应用位点不重复推进。重复中断或无中断恢复在422拒绝。
+- 新版（version=new）查询：变更未在目标副本应用前，改走已具备新表结构的健康别站，无别站则拒读，绝不回退到锁表副本；变更应用后才回到目标副本。
+- 变更应用后到达的旧版查询按结构不兼容拒读；被取消查询在计划结束点产生的迟到结果一律 `rejected`，不能返回成功。
+- 汇总输出取消查询数与 ID、回放等待表锁毫秒、主库变更到副本追上毫秒、新旧查询各去向计数、中断次数，以及恒为 0 的重复取消/重复推进哨兵字段和 SHA256。相同输入产生相同摘要。
+
 ## 工程说明
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页、编辑表单、共享组件、/api代理|
+|frontend|原生HTML/CSS/JS + Nginx|路由4业务页+锁表3业务页、编辑表单、共享组件、/api代理|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
-|worker|Python3.11|会话时序与路由算法|
+|worker|Python3.11|路由时序算法与DDL锁表回放，消费两个Redis队列|
 |db|MySQL8.0|真实持久化业务和JSON证据|
 |redis|Redis7|持久队列|
 
@@ -71,7 +94,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 本地开发：Python3.11安装backend/requirements.txt、配置DATABASE_URL/REDIS_URL，在backend运行 `uvicorn src.main:app --reload` 和 `python -m src.worker`，前端经Nginx同源代理。停止清空：`docker compose down -v --remove-orphans`。
 
-限制：单worker串行、无生产任务重试/崩溃续跑；不模拟网络随机抖动、自动选主或完整GTID集合。Google Fonts离线回退，业务不依赖字体网络。
+限制：单worker串行消费 `replicaroute:queue` 与 `replicalock:queue`、无生产任务重试/崩溃续跑；不模拟网络随机抖动、自动选主或完整GTID集合。Google Fonts离线回退，业务不依赖字体网络。
 
 ## License
 
